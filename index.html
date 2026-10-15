@@ -130,7 +130,7 @@ window._mqttReady=(typeof mqtt!=='undefined')
 </head>
 <body>
 <div class="wrap">
-  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.4</span></span></h1>
+  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.5</span></span></h1>
   <p class="sub">两台电脑各自打开本文件，用一个 6 位房间号自动连接，即可测试「能不能直连、走公网打洞还是中继、延迟多少、丢不丢包」。自动交换信令，<b>对方操作慢也不会掉线</b>。</p>
 
   <div class="steps">
@@ -240,15 +240,53 @@ window._mqttReady=(typeof mqtt!=='undefined')
 
 <script>
 const $ = id => document.getElementById(id);
-const ICE_SERVERS = {
-  iceServers: [
-    {urls:'stun:stun.cloudflare.com:3478'},
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun.miwifi.com:3478'},
-    {urls:'stun:stun.qq.com:3478'}
-  ],
-  iceCandidatePoolSize: 4
-};
+/* ---------- ICE 服务器：STUN 探测 + 可选 TURN 中继 ----------
+   打洞走不通时，只要配了 turn:，WebRTC 会自动回落走中继，数据通道照样建立。
+   中继配置来源（优先级从高到低）：
+     1) URL 片段 #turn=<base64(JSON)>  —— 便于把配置随链接一起发给对方
+     2) localStorage['turnCfg']        —— 收到过一次就记住，之后刷新仍生效
+   刻意不把中继凭据写死在页面里：这个页面是托管在公开仓库上的。 */
+const STUN_LIST = [
+  'stun:stun.cloudflare.com:3478',
+  'stun:stun.l.google.com:19302',
+  'stun:stun.miwifi.com:3478',
+  'stun:stun.qq.com:3478'
+];
+function b64d(s){
+  s = s.replace(/-/g,'+').replace(/_/g,'/');
+  s += '='.repeat((4 - s.length % 4) % 4);
+  return decodeURIComponent(escape(atob(s)));
+}
+function readTurnCfg(){
+  try{
+    const m = location.hash.match(/turn=([A-Za-z0-9\-_=]+)/);
+    if(m){
+      const cfg = JSON.parse(b64d(m[1]));
+      localStorage.setItem('turnCfg', JSON.stringify(cfg));
+      return cfg;
+    }
+  }catch(e){}
+  try{ const s = localStorage.getItem('turnCfg'); if(s) return JSON.parse(s); }catch(e){}
+  return null;
+}
+const TURN_CFG = readTurnCfg();
+const ICE_SERVERS = (function(){
+  const list = STUN_LIST.map(u=>({urls:u}));
+  if(TURN_CFG && TURN_CFG.url){
+    list.push({
+      urls: [TURN_CFG.url].concat(TURN_CFG.urlTcp?[TURN_CFG.urlTcp]:[]),
+      username: TURN_CFG.user || '',
+      credential: TURN_CFG.pass || ''
+    });
+  }
+  return { iceServers: list, iceCandidatePoolSize: 4 };
+})();
+function turnLabel(){
+  return (TURN_CFG && TURN_CFG.url)
+    ? ('已配置 ' + TURN_CFG.url.replace(/^turns?:/,'') + (TURN_CFG.urlTcp?' + TCP':'') + '（打洞失败会自动回落）')
+    : '未配置，只走直连';
+}
+window.addEventListener('load', ()=>{ try{ log('中继（TURN）：'+turnLabel(),'info'); }catch(e){} });
 
 let pc=null, dc=null, myCands=[], lastPairInfo='—';
 let pingSeq=0, sent=0, recv=0, lost=0, pending={};
