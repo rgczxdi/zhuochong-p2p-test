@@ -171,6 +171,14 @@ window._mqttReady=(typeof mqtt!=='undefined')
         <span id="room-code" style="font-size:30px;font-weight:700;letter-spacing:8px;color:var(--accent);flex:1"></span>
         <button class="btn-ghost" id="btn-copy-room" style="padding:8px 16px">复制房间号</button>
       </div>
+      <div style="border-top:1px solid var(--line);margin-top:13px;padding-top:12px">
+        <div style="font-size:12px;color:var(--txt-3);margin-bottom:7px"><b>网页版（最省事）</b>：点下面复制邀请链接，把<b>链接</b>发给对方，对方点开即自动连接，不用接收文件、不用任何操作。</div>
+        <button class="btn-green" id="btn-copy-link" style="width:100%">复制邀请链接（对方点开即自动连）</button>
+      </div>
+      <div style="border-top:1px solid var(--line);margin-top:13px;padding-top:12px">
+        <div style="font-size:12px;color:var(--txt-3);margin-bottom:7px"><b>备用（离线文件）</b>：生成一个专属文件，把该<b>文件</b>发给对方，对方双击打开即自动连接。</div>
+        <button class="btn-ghost" id="btn-gen-oneclick" style="width:100%">生成对方一键文件（对方双击打开即连）</button>
+      </div>
     </div>
   </div>
 
@@ -288,6 +296,20 @@ function turnLabel(){
 }
 window.addEventListener('load', ()=>{ try{ log('中继（TURN）：'+turnLabel(),'info'); }catch(e){} });
 
+var AUTO_JOIN_ROOM=null;   // 非 null 时，打开页面即自动加入该房间，无需任何操作（一键文件 / URL 链接两种来源）
+/* 网页版：支持 URL 携带房间号，对方点开链接即自动加入，无需接收文件。
+   支持：#3W6XLZ、#room=3W6XLZ、?room=3W6XLZ */
+(function(){
+  let h='';
+  try{
+    h=(location.hash||'').replace(/^#/,'');
+    const q=new URLSearchParams(location.search).get('room');
+    if(q) h=q;
+    if(h.toLowerCase().indexOf('room=')===0) h=h.slice(5);
+  }catch(e){}
+  h=(h||'').trim().toUpperCase();
+  if(/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/.test(h)) AUTO_JOIN_ROOM=h;
+})();
 let pc=null, dc=null, myCands=[], lastPairInfo='—';
 let pingSeq=0, sent=0, recv=0, lost=0, pending={};
 let rttMin=9999, rttMax=0, rttSum=0, rttCnt=0, pingTimer=null;
@@ -603,8 +625,8 @@ async function onRemoteAnswer(m){
 }
 
 /* --- 加入方：加入房间 --- */
-$('btn-join').onclick=async()=>{
-  const code=($('in-room').value||'').trim().toUpperCase();
+async function joinRoom(code){
+  code=(code||'').trim().toUpperCase();
   if(code.length!==6){ alert('请输入 6 位房间号'); return; }
   resetAll(false);
   role='join'; room=code;
@@ -631,7 +653,8 @@ $('btn-join').onclick=async()=>{
   sendHello();
   helloTimer=setInterval(sendHello,1000);
   setStatus('connecting','正在加入房间…','正在向主机请求邀请');
-};
+}
+$('btn-join').onclick=()=>joinRoom($('in-room').value);
 let helloTimer=null;
 async function onRemoteOffer(m){
   setStatus('connecting','收到邀请，正在生成回复…','');
@@ -918,6 +941,52 @@ $('btn-copy-room').onclick=async()=>{
   log('已复制房间号 '+code+'，发给对方输入即可','info');
 };
 
+/* ---------- 复制邀请链接（网页版，对方点开即自动加入） ---------- */
+function inviteLink(){
+  const base=location.origin+location.pathname;
+  return base+'#'+room;
+}
+$('btn-copy-link').onclick=async()=>{
+  if(!room){ alert('请先点「创建房间」'); return; }
+  if(location.protocol!=='http:'&&location.protocol!=='https:'){
+    alert('当前是本地文件打开，没有网页链接；请改用「生成对方一键文件」，或把本工具部署到网页后再用此功能。');
+    return;
+  }
+  const link=inviteLink();
+  try{ await navigator.clipboard.writeText(link); }
+  catch(e){
+    const t=document.createElement('textarea'); t.value=link;
+    document.body.appendChild(t); t.select();
+    try{ document.execCommand('copy'); }catch(e2){}
+    t.remove();
+  }
+  log('已复制邀请链接，发给对方，对方点开即自动连接（无需接收文件、无需操作）','ok');
+};
+
+/* ---------- 生成对方一键文件（打开即自动加入，零操作） ---------- */
+function buildOneClickHTML(){
+  if(!room) throw new Error('请先点「创建房间」');
+  let html='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+  // 清理动态注入的 CDN <script src=...mqtt...>，只保留内置多源加载器（避免重复加载）
+  html=html.replace(/<script[^>]*\ssrc="[^"]*mqtt[^"]*"[^>]*>\s*<\/script>/gi,'');
+  // 写入「打开即自动加入」的房间号（序列化保留的是脚本源码文本）
+  if(!/var AUTO_JOIN_ROOM=[^;]*;/.test(html)) throw new Error('内部标记缺失，无法生成');
+  html=html.replace(/var AUTO_JOIN_ROOM=[^;]*;/, 'var AUTO_JOIN_ROOM="'+room+'";');
+  return html;
+}
+$('btn-gen-oneclick').onclick=()=>{
+  let html;
+  try{ html=buildOneClickHTML(); }
+  catch(e){ alert(e.message); return; }
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='双击打开-自动连接-'+room+'.html';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  log('已生成对方一键文件（房间 '+room+'）。把该文件发给对方，对方双击打开即自动连接，无需输入或点击','ok');
+};
+
 /* ---------- 模式切换 ---------- */
 function showPane(mode){
   $('pane-auto').style.display = mode==='auto'?'block':'none';
@@ -958,6 +1027,15 @@ function resetAll(verbose){
 }
 $('btn-reset').onclick=()=>{ resetAll(true); };
 resetAll(false);
+
+/* 一键文件：打开即自动加入指定房间，无需任何输入或点击 */
+if(AUTO_JOIN_ROOM){
+  try{ showPane('auto'); }catch(e){}
+  setTimeout(()=>{
+    log('一键文件：打开即自动加入房间 '+AUTO_JOIN_ROOM+'，无需操作','ok');
+    joinRoom(AUTO_JOIN_ROOM);
+  }, 300);
+}
 
 </script>
 </body>
