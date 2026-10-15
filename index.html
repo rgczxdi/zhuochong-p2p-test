@@ -130,7 +130,7 @@ window._mqttReady=(typeof mqtt!=='undefined')
 </head>
 <body>
 <div class="wrap">
-  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.3</span></span></h1>
+  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.4</span></span></h1>
   <p class="sub">两台电脑各自打开本文件，用一个 6 位房间号自动连接，即可测试「能不能直连、走公网打洞还是中继、延迟多少、丢不丢包」。自动交换信令，<b>对方操作慢也不会掉线</b>。</p>
 
   <div class="steps">
@@ -752,10 +752,12 @@ setInterval(analyze,2000);
    因此能拿到「同一个本地端口对多个 STUN 服务器」的全部映射，
    才能真正区分圆锥型（映射与目的地无关）和对称型（每个目的地换个端口）。 */
 $('btn-nat').onclick=()=>{
-  log('开始检测本机 NAT 类型：向 4 个 STUN 服务器询问公网映射…','info');
+  log('开始检测本机 NAT 类型：向 6 个 STUN 服务器询问公网映射…','info');
   const probe=new RTCPeerConnection({iceServers:[
     {urls:'stun:stun.cloudflare.com:3478'},
     {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'},
+    {urls:'stun:stun.nextcloud.com:443'},
     {urls:'stun:stun.miwifi.com:3478'},
     {urls:'stun:stun.qq.com:3478'}
   ]});
@@ -772,12 +774,21 @@ $('btn-nat').onclick=()=>{
       +' ← 本地 :'+c.relatedPort+' via '+c.url,'info'));
     const ports=Array.from(new Set(found.map(c=>c.port)));
     const locals=Array.from(new Set(found.map(c=>c.relatedPort).filter(p=>p)));
+    const servers=Array.from(new Set(found.map(c=>c.url)));
+    log('  共 '+servers.length+' 个 STUN 服务器回应，'+found.length+' 个映射 → '+ports.length+' 个不同公网端口','info');
+    /* 【修复】原实现只要 ports.length===1 就判「圆锥型」，哪怕只有一个 STUN 服务器回应。
+       单点数据根本无法区分圆锥与对称，这会把对称型 NAT 误报成圆锥型，
+       让人误以为「打洞成功率高」而去白白重试。
+       现在要求：至少 2 个不同 STUN 服务器看到同一个端口，才敢下圆锥型结论。 */
     if(ports.length>=2&&locals.length===1){
       log('NAT 类型：【对称型 NAT】同一本地端口('+locals[0]+')对不同目的地映射到 '
         +ports.length+' 个不同公网端口（'+ports.join(' / ')+'）→ UDP 打洞成功率很低','err');
+    }else if(ports.length===1&&servers.length>=2){
+      log('NAT 类型：【圆锥型 NAT】'+servers.length+' 个不同 STUN 服务器都看到同一个公网端口 '
+        +ports[0]+' → 打洞成功率高','ok');
     }else if(ports.length===1){
-      log('NAT 类型：【圆锥型 NAT】不同 STUN 服务器都看到同一个公网端口 '+ports[0]
-        +' → 打洞成功率高','ok');
+      log('NAT 类型：未能确定 —— 只有 '+servers.length+' 个 STUN 服务器回应、拿到 1 个公网端口 '+ports[0]
+        +'；单点数据无法区分圆锥/对称，至少需要 2 个服务器回应才能判定','warn');
     }else{
       log('NAT 类型：未能确定（拿到 '+ports.length+' 个映射，本地端口 '
         +locals.length+' 个）','warn');
