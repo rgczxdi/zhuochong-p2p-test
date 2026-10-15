@@ -130,7 +130,7 @@ window._mqttReady=(typeof mqtt!=='undefined')
 </head>
 <body>
 <div class="wrap">
-  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.2</span></span></h1>
+  <h1>P2P 打洞测试工具 <span style="font-size:12px;color:var(--txt-3);font-weight:600;vertical-align:middle;letter-spacing:0">build <span id="app-ver">2026-10-15.3</span></span></h1>
   <p class="sub">两台电脑各自打开本文件，用一个 6 位房间号自动连接，即可测试「能不能直连、走公网打洞还是中继、延迟多少、丢不丢包」。自动交换信令，<b>对方操作慢也不会掉线</b>。</p>
 
   <div class="steps">
@@ -317,9 +317,72 @@ function gatherComplete(){
   });
 }
 
+/* ---------- 候选对持续观测 ----------
+   为什么必须有：Chromium 一旦把 ICE 判为 failed，会把 remote-candidate 和
+   candidate-pair 这两类统计整个清掉。失败后再拉 getStats 只能拿到一堆 0，
+   看不出「包到底发出去没有、有没有回来」。
+   所以在 checking 期间就开始每 1.5 秒采样，把每条候选对的峰值留在这里。 */
+const pairHistory=new Map();
+let pairWatchTimer=null;
+let remoteCandEverSeen=0;
+const remoteCandTypes={};
+
+function sdpCandSummary(sdp){
+  const lines=(sdp||'').split(/\r?\n/).filter(l=>l.indexOf('a=candidate:')===0);
+  const byType={}; let mdns=0;
+  for(const l of lines){
+    const p=l.split(' ');
+    const i=p.indexOf('typ');
+    const typ=(i>=0?(p[i+1]||'?'):'?');
+    byType[typ]=(byType[typ]||0)+1;
+    if(i>0 && /\.local$/i.test(p[i-1])) mdns++;
+  }
+  return {total:lines.length, byType:byType, mdns:mdns};
+}
+function describeCandSummary(s){
+  const parts=Object.keys(s.byType).map(t=>t+'×'+s.byType[t]);
+  return '共 '+s.total+' 个（'+(parts.join(', ')||'无')+'）'
+       + (s.mdns ? ('，其中 '+s.mdns+' 个是 mDNS 混淆的 .local（跨公网不可用）') : '');
+}
+
+function startPairWatch(){
+  if(pairWatchTimer) return;
+  pairWatchTimer=setInterval(async()=>{
+    if(!pc) return;
+    try{
+      const s=await pc.getStats();
+      const byId={}; s.forEach(o=>{ byId[o.id]=o; });
+      s.forEach(o=>{
+        if(o.type!=='remote-candidate') return;
+        remoteCandEverSeen++;
+        if(o.candidateType) remoteCandTypes[o.candidateType]=(remoteCandTypes[o.candidateType]||0)+1;
+      });
+      s.forEach(o=>{
+        if(o.type!=='candidate-pair') return;
+        const l=byId[o.localCandidateId]||{}, r=byId[o.remoteCandidateId]||{};
+        const key=(l.candidateType||'?')+' '+(l.address||'?')+':'+(l.port||'?')
+                 +'  ↔  '+(r.candidateType||'?')+' '+(r.address||'?')+':'+(r.port||'?');
+        let h=pairHistory.get(key);
+        if(!h){ h={key:key,maxSent:0,maxRespRecv:0,maxReqRecv:0,maxRespSent:0,states:[],nominated:false}; pairHistory.set(key,h); }
+        h.maxSent     = Math.max(h.maxSent,     o.requestsSent||0);
+        h.maxRespRecv = Math.max(h.maxRespRecv, o.responsesReceived||0);
+        h.maxReqRecv  = Math.max(h.maxReqRecv,  o.requestsReceived||0);
+        h.maxRespSent = Math.max(h.maxRespSent, o.responsesSent||0);
+        if(o.state && h.states.indexOf(o.state)<0) h.states.push(o.state);
+        if(o.nominated) h.nominated=true;
+      });
+    }catch(e){}
+  },1500);
+}
+function stopPairWatch(){ if(pairWatchTimer){ clearInterval(pairWatchTimer); pairWatchTimer=null; } }
+
 function createPC(){
   pc=new RTCPeerConnection(ICE_SERVERS);
   myCands=[];
+  stopPairWatch();
+  pairHistory.clear();
+  remoteCandEverSeen=0;
+  for(const k in remoteCandTypes) delete remoteCandTypes[k];
   pc.onicecandidate=e=>{
     if(!e.candidate) return;
     myCands.push(e.candidate);
@@ -340,6 +403,7 @@ function createPC(){
     if(st!=='disconnected'&&st!=='failed'){ log('ICE 状态 → '+st,'info'); }
     if(st==='checking'){
       if(recoverTimer){clearTimeout(recoverTimer);recoverTimer=null;}
+      startPairWatch();
       setStatus('checking','正在打洞…','双方正在交换地址、尝试 P2P 直连');
     }
     else if(st==='connected'||st==='completed'){
@@ -491,6 +555,10 @@ async function onRemoteAnswer(m){
   if(remoteDescSet) return;
   await pc.setRemoteDescription(new RTCSessionDescription(m.desc));
   for(const c of (m.cands||[])){ await pc.addIceCandidate(new RTCIceCandidate(c)); }
+  /* 把对端候选构成写进日志：mDNS 混淆的 .local 是跨公网不可用的，
+     真实可用的往往只剩 1 个 srflx —— 这直接决定后面还有没有的打。 */
+  log('对端候选：'+describeCandSummary(sdpCandSummary(m.desc&&m.desc.sdp)),'info');
+  startPairWatch();
   remoteDescSet=true;
   setStep(3);
   log('已收到对方回复，开始打洞…','info');
@@ -531,7 +599,8 @@ async function onRemoteOffer(m){
   setStatus('connecting','收到邀请，正在生成回复…','');
   await pc.setRemoteDescription(new RTCSessionDescription(m.desc));
   for(const c of (m.cands||[])){ await pc.addIceCandidate(new RTCIceCandidate(c)); }
-  const answer=await pc.createAnswer();
+  log('对端候选：'+describeCandSummary(sdpCandSummary(m.desc&&m.desc.sdp)),'info');
+  startPairWatch();  const answer=await pc.createAnswer();
   await pc.setLocalDescription(answer);
   await gatherComplete();
   mqttPublish(MQTT_PREFIX+room+'/join',{kind:'answer',desc:pc.localDescription,cands:myCands});
@@ -596,27 +665,29 @@ $('btn-process').onclick=async()=>{
   }
 };
 
-/* ---------- 失败时导出全部候选对，便于定位到底卡在哪一对 ---------- */
+/* ---------- 失败时导出候选对「历史」，便于定位到底卡在哪一对 ----------
+   不再直接读当前 getStats：ICE 判 failed 后 Chromium 会把 remote-candidate 和
+   candidate-pair 两类统计清空，那时读到的是空表，会把 NAT 问题误判成「候选没交换」。 */
 async function dumpPairs(tag){
-  if(!pc) return;
-  try{
-    const stats=await pc.getStats();
-    const byId={};
-    stats.forEach(o=>{ byId[o.id]=o; });
-    const rows=[];
-    stats.forEach(o=>{
-      if(o.type!=='candidate-pair') return;
-      const l=byId[o.localCandidateId], r=byId[o.remoteCandidateId];
-      if(!l||!r) return;
-      rows.push('  '+(l.candidateType||'?')+' ↔ '+(r.candidateType||'?')
-        +'  state='+o.state+(o.nominated?' nominated':'')+(o.selected?' selected':'')
-        +'  '+(l.address||'?')+':'+(l.port||'?')+' <-> '+(r.address||'?')+':'+(r.port||'?'));
-    });
-    log('【'+tag+'】本次共 '+rows.length+' 个候选对：','warn');
-    rows.slice(0,12).forEach(t=>log(t,'warn'));
-    if(rows.length>12) log('  …另外 '+(rows.length-12)+' 个省略','warn');
-    if(rows.length===0) log('  （没有任何候选对，说明双方候选没交换成功）','warn');
-  }catch(e){ log('导出候选对失败：'+e,'err'); }
+  log('【'+tag+'】候选对历史（checking 起每 1.5 秒采样）：','warn');
+  if(remoteCandEverSeen===0){
+    log('  ⚠ 全程一个远端候选都没出现过 → 问题在信令/候选解析，不在 NAT','warn');
+  }else{
+    const ts=Object.keys(remoteCandTypes).map(t=>t+'×'+remoteCandTypes[t]).join(', ');
+    log('  远端候选累计出现 '+remoteCandEverSeen+' 次，类型：'+(ts||'未知'),'warn');
+  }
+  if(pairHistory.size===0){
+    log('  （没有任何候选对进入过统计）','warn');
+  }else{
+    log('  共 '+pairHistory.size+' 条候选对：','warn');
+    let n=0;
+    for(const h of pairHistory.values()){
+      if(n++>=14){ log('  …其余 '+(pairHistory.size-14)+' 条省略','warn'); break; }
+      log('  '+h.key+'  state='+h.states.join('/')+(h.nominated?' nominated':'')
+          +'  发出检查='+h.maxSent+' 收到应答='+h.maxRespRecv
+          +'  收到请求='+h.maxReqRecv+' 发出应答='+h.maxRespSent,'warn');
+    }
+  }
 }
 
 /* ---------- 分析连接方式（getStats） ---------- */
